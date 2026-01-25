@@ -19,6 +19,59 @@ import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 
+# def estimate_divergence_hutchinson(
+#     pipe,
+#     latents: torch.Tensor,
+#     pred: torch.Tensor,
+#     eps_list,
+#     guidance_scale: float = 7.0,
+#     device: str = "cuda",
+# ):
+#     """
+#     Returns scalar divergence estimate:
+#       div(u)(x) = Tr(du/dx)
+#     using Hutchinson estimator: Tr(J) = E[eps^T J eps].
+
+#     Implementation uses vJP:
+#       eps^T J eps = d/dx <u(x), eps> dotted with eps.
+#     """
+#     # Make latents a leaf so autograd.grad works reliably and does not keep old graphs.
+#     x = latents.detach().requires_grad_(True)
+
+#     # Forward: u(x) (here: "pred" from sd3_timestep_pipe)
+
+
+#     # Accumulate multiple Hutchinson probes (common across candidates if eps_list is shared)
+#     div_total = torch.zeros((), device=x.device, dtype=torch.float32)
+
+#     n = len(eps_list)
+#     for s, eps in enumerate(eps_list):
+#         # Important: eps should not require grad
+#         eps = eps.detach()
+
+#         # scalar: <pred, eps> / D  (divide-by-D is optional; keeps scale tame)
+#         vp = torch.sum(pred * eps) / D
+
+#         # vjp = d/dx vp = (J^T eps) / D
+#         # retain_graph must be True except for the last probe, because we reuse the same forward graph.
+#         vjp = torch.autograd.grad(
+#             vp,
+#             x,
+#             retain_graph=(s != n - 1),
+#             create_graph=False,
+#             allow_unused=False,
+#         )[0]
+
+#         # eps^T J eps / D
+#         div_s = torch.sum(vjp * eps).to(torch.float32)
+#         div_total = div_total + div_s
+
+#     div_avg = div_total / float(n)
+
+#     # Return scalar tensor (float32)
+#     return div_avg
+
+
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
 
@@ -58,6 +111,118 @@ def edm_sampler(
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
     return x_next
+
+
+## ours
+def edm_sampler_ours(
+    net, latents, class_labels=None, randn_like=torch.randn_like,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, num_iter=2, seed=42, lr=0.5
+):
+    SEED = seed
+
+    # Adjust noise levels based on what's supported by the network.
+    sigma_min = max(sigma_min, net.sigma_min)
+    sigma_max = min(sigma_max, net.sigma_max)
+
+    # Time step discretization.
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+
+    # Main sampling loop.
+    x_next = latents.to(torch.float64) * t_steps[0]
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        
+        x_cur = x_next
+        x_cur = x_cur.detach().requires_grad_(True)
+        # Increase noise temporarily.
+        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+        t_hat = net.round_sigma(t_cur + gamma * t_cur)
+        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+
+        # Euler step.
+        # x_hat = x_hat.detach().requires_grad_(True)
+        denoised = net(x_hat, t_hat, class_labels).to(torch.float64) # (B, C, H, W)
+        # approximate divergence with Hutchinson's estimator
+        # single noise for estimation 
+        noise = torch.randn(x_hat.shape, device=x_hat.device, generator=torch.Generator(SEED)) # (B, C, H, W)
+        # vp -> vjp
+        # import ipdb; ipdb.set_trace()
+        prod = torch.sum(denoised * noise) # scalar
+        vjp = torch.autograd.grad(
+            prod,
+            x_cur,
+            retain_graph=False,
+            create_graph=False
+        )[0] # (B, C, H, W)
+
+        div = torch.sum(vjp * noise).to(torch.float32)
+        D = x_hat.shape[1] * x_hat.shape[2] * x_hat.shape[3]  # dimensionality
+        div = div / float(D)
+        # print('step:', i, 'divergence:', div.item())
+
+        cur_best_x_hat = x_hat.detach()
+        cur_best_x_cur = x_cur.detach()
+        cur_best_div = div.detach()
+        del vjp, prod
+
+        ## our algorithm
+        lr_t = (1. - i / num_steps) * lr  # can be tuned
+        for iter in range(num_iter):
+            new_noise = torch.randn(x_hat.shape, device=x_hat.device) #, generator=torch.Generator(SEED + iter + 1))
+            # if i == 0:
+            #     perturbed_x_cur = np.sqrt(1. - lr_t**2) * cur_best_x_cur + lr_t * new_noise
+            #     # perturbed_x_hat = (1. - lr_t) * cur_best_x_hat + lr_t * new_noise
+            # else:
+            
+                # perturbed_x_hat = cur_best_x_hat + lr_t * new_noise
+            perturbed_x_cur = cur_best_x_cur + lr_t * new_noise
+            perturbed_x_cur = perturbed_x_cur.detach().requires_grad_(True)
+            # perturbed_x_hat = perturbed_x_hat.detach().requires_grad_(True)
+            perturbed_x_hat = perturbed_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(perturbed_x_cur)
+            denoised_perturbed = net(perturbed_x_hat, t_hat, class_labels).to(torch.float64)
+
+            # vp -> vjp
+            prod_perturbed = torch.sum(denoised_perturbed * noise)
+            vjp_perturbed = torch.autograd.grad(
+                prod_perturbed,
+                # perturbed_x_hat,
+                perturbed_x_cur,
+                retain_graph=False,
+                create_graph=False
+            )[0]
+
+            div_perturbed = torch.sum(vjp_perturbed * noise).to(torch.float32)
+            div_perturbed = div_perturbed / float(D)
+            # print('  iter:', iter, 'divergence:', div_perturbed.item())
+            # update best noise
+            if div_perturbed < cur_best_div:
+                cur_best_x_hat = perturbed_x_hat.detach()
+                cur_best_div = div_perturbed.detach()
+                cur_best_x_cur = perturbed_x_cur.detach()
+            # if i==0:
+            #     cur_best_x_cur = perturbed_x_cur.detach()
+                # break
+            del vjp_perturbed, prod_perturbed, denoised_perturbed
+        # forward with final best noise
+        # best_x_hat = cur_best_x_hat.detach().requires_grad_(True)
+        best_x_hat = cur_best_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(cur_best_x_cur)
+        denoised = net(best_x_hat, t_hat, class_labels).to(torch.float64)
+
+
+        x_hat = best_x_hat.detach()
+        d_cur = (x_hat - denoised) / t_hat
+        x_next = x_hat + (t_next - t_hat) * d_cur
+
+        # Apply 2nd order correction.
+        if i < num_steps - 1:
+            denoised = net(x_next, t_next, class_labels).to(torch.float64)
+            d_prime = (x_next - denoised) / t_next
+            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+    return x_next
+
 
 #----------------------------------------------------------------------------
 # Generalized ablation sampler, representing the superset of all sampling
@@ -215,11 +380,17 @@ def parse_int_list(s):
 
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
-@click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
+@click.option('--outdir',  'exp_name',     help='Where to save the output images', metavar='DIR',                   type=str, required=True)
 @click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
+
+# sampler options
+@click.option('--sampler', 'sampler_type', help='Sampler type', metavar='ours|default',                              type=click.Choice(['ours', 'default']), default='ours')
+@click.option('--sampler_lr',              help='x_t update rate', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=0.5)
+@click.option('--sampler_iter',            help='Number of iterations for each step', metavar='INT',              type=click.IntRange(min=1), default=2)
+
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -235,7 +406,7 @@ def parse_int_list(s):
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, exp_name, subdirs, seeds, class_idx, max_batch_size, sampler_lr, sampler_iter, device=torch.device('cuda'), sampler_type='ours', **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -255,6 +426,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
     rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
+    outdir = os.path.join('results', exp_name)
 
     # Rank 0 goes first.
     if dist.get_rank() != 0:
@@ -270,7 +442,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         torch.distributed.barrier()
 
     # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
+    dist.print0(f'Generating {len(seeds)} images to "results/{exp_name}"...')
     for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
         torch.distributed.barrier()
         batch_size = len(batch_seeds)
@@ -290,8 +462,14 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         # Generate images.
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+        # sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
+        # if sampler_kwargs.get('ours', False):
+        if sampler_type == 'ours':
+            sampler_fn = edm_sampler_ours
+            images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, lr=sampler_lr, num_iter=sampler_iter, **sampler_kwargs)
+        else:
+            sampler_fn = edm_sampler
+            images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()

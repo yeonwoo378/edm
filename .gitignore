@@ -1,0 +1,7 @@
+results/
+__pycache__
+dnnlib/__pycache__
+*.tar
+*.tar.gz
+*.zip
+*.ipynb
