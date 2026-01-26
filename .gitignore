@@ -1,7 +1,10 @@
 results/
 __pycache__
 dnnlib/__pycache__
+fid-refs/
+datasets/
 *.tar
 *.tar.gz
 *.zip
 *.ipynb
+
