@@ -147,30 +147,32 @@ def edm_sampler_ours(
         # approximate divergence with Hutchinson's estimator
         # single noise for estimation 
         noise = torch.randn(x_hat.shape, device=x_hat.device, generator=torch.Generator(SEED)) # (B, C, H, W)
-        # vp -> vjp
-        # import ipdb; ipdb.set_trace()
-        prod = torch.sum(denoised * noise) # scalar
+
         vjp = torch.autograd.grad(
-            prod,
+            denoised,
             x_cur,
+            grad_outputs=noise,
             retain_graph=False,
             create_graph=False
         )[0] # (B, C, H, W)
 
-        div = torch.sum(vjp * noise).to(torch.float32)
+        # div = torch.sum(vjp * noise).to(torch.float32)
+        div_per_sample = (vjp * noise).flatten(1).sum(1).float()  # (B,)
         D = x_hat.shape[1] * x_hat.shape[2] * x_hat.shape[3]  # dimensionality
-        div = div / float(D)
+        # div = div / float(D)
         # print('step:', i, 'divergence:', div.item())
 
         cur_best_x_hat = x_hat.detach()
         cur_best_x_cur = x_cur.detach()
-        cur_best_div = div.detach()
-        del vjp, prod
+        cur_best_div = div_per_sample.detach() / float(D)  # (B,)
 
         ## our algorithm
         lr_t = (1. - i / num_steps) * lr  # can be tuned
         for iter in range(num_iter):
-            new_noise = torch.randn(x_hat.shape, device=x_hat.device) #, generator=torch.Generator(SEED + iter + 1))
+            gen = torch.Generator(device=x_hat.device)
+            gen.manual_seed(SEED + iter + 1)
+            new_noise = torch.randn(x_hat.shape, device=x_hat.device, generator=gen)
+
             # if i == 0:
             #     perturbed_x_cur = np.sqrt(1. - lr_t**2) * cur_best_x_cur + lr_t * new_noise
             #     # perturbed_x_hat = (1. - lr_t) * cur_best_x_hat + lr_t * new_noise
@@ -184,27 +186,33 @@ def edm_sampler_ours(
             denoised_perturbed = net(perturbed_x_hat, t_hat, class_labels).to(torch.float64)
 
             # vp -> vjp
-            prod_perturbed = torch.sum(denoised_perturbed * noise)
+            # prod_perturbed = torch.sum(denoised_perturbed * noise)
+            # vjp_perturbed = torch.autograd.grad(
+            #     prod_perturbed,
+            #     # perturbed_x_hat,
+            #     perturbed_x_cur,
+            #     retain_graph=False,
+            #     create_graph=False
+            # )[0]
             vjp_perturbed = torch.autograd.grad(
-                prod_perturbed,
-                # perturbed_x_hat,
+                denoised_perturbed,
                 perturbed_x_cur,
+                grad_outputs=noise,
                 retain_graph=False,
                 create_graph=False
-            )[0]
+            )[0] # (B, C, H, W) 
+            div_perturbed_per_sample = (vjp_perturbed * noise).flatten(1).sum(1).float() / float(D)
 
-            div_perturbed = torch.sum(vjp_perturbed * noise).to(torch.float32)
-            div_perturbed = div_perturbed / float(D)
-            # print('  iter:', iter, 'divergence:', div_perturbed.item())
-            # update best noise
-            if div_perturbed < cur_best_div:
-                cur_best_x_hat = perturbed_x_hat.detach()
-                cur_best_div = div_perturbed.detach()
-                cur_best_x_cur = perturbed_x_cur.detach()
-            # if i==0:
-            #     cur_best_x_cur = perturbed_x_cur.detach()
-                # break
-            del vjp_perturbed, prod_perturbed, denoised_perturbed
+
+
+            mask = (div_perturbed_per_sample) ** 2 < (cur_best_div) ** 2
+            mask = mask.view(-1, *[1]*(len(x_hat.shape)-1))  # reshape for broadcasting
+            cur_best_x_hat = torch.where(mask, perturbed_x_hat.detach(), cur_best_x_hat)
+            cur_best_div = torch.where(mask.squeeze(), div_perturbed_per_sample.detach(), cur_best_div)
+            cur_best_x_cur = torch.where(mask, perturbed_x_cur.detach(), cur_best_x_cur)
+
+      
+            del vjp_perturbed, denoised_perturbed
         # forward with final best noise
         # best_x_hat = cur_best_x_hat.detach().requires_grad_(True)
         best_x_hat = cur_best_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(cur_best_x_cur)
