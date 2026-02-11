@@ -165,9 +165,10 @@ def edm_sampler_ours(
         cur_best_x_hat = x_hat.detach()
         cur_best_x_cur = x_cur.detach()
         cur_best_div = div_per_sample.detach() / float(D)  # (B,)
+        # print('Initial divergence:', cur_best_div, cur_best_div.shape)
 
         ## our algorithm
-        lr_t = (1. - i / num_steps) * lr  # can be tuned
+        lr_t = (1. - i / num_steps) * lr 
         for iter in range(num_iter):
             gen = torch.Generator(device=x_hat.device)
             gen.manual_seed(SEED + iter + 1)
@@ -185,15 +186,6 @@ def edm_sampler_ours(
             perturbed_x_hat = perturbed_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(perturbed_x_cur)
             denoised_perturbed = net(perturbed_x_hat, t_hat, class_labels).to(torch.float64)
 
-            # vp -> vjp
-            # prod_perturbed = torch.sum(denoised_perturbed * noise)
-            # vjp_perturbed = torch.autograd.grad(
-            #     prod_perturbed,
-            #     # perturbed_x_hat,
-            #     perturbed_x_cur,
-            #     retain_graph=False,
-            #     create_graph=False
-            # )[0]
             vjp_perturbed = torch.autograd.grad(
                 denoised_perturbed,
                 perturbed_x_cur,
@@ -202,7 +194,7 @@ def edm_sampler_ours(
                 create_graph=False
             )[0] # (B, C, H, W) 
             div_perturbed_per_sample = (vjp_perturbed * noise).flatten(1).sum(1).float() / float(D)
-
+            # print(f'Iter {iter}: perturbed divergence:', div_perturbed_per_sample, div_perturbed_per_sample.shape)
 
 
             mask = (div_perturbed_per_sample) ** 2 < (cur_best_div) ** 2
@@ -210,9 +202,11 @@ def edm_sampler_ours(
             cur_best_x_hat = torch.where(mask, perturbed_x_hat.detach(), cur_best_x_hat)
             cur_best_div = torch.where(mask.squeeze(), div_perturbed_per_sample.detach(), cur_best_div)
             cur_best_x_cur = torch.where(mask, perturbed_x_cur.detach(), cur_best_x_cur)
-
-      
+            # print('Updated divergence:', cur_best_div, cur_best_div.shape   )
+            # print('mask sum:', mask, mask.shape)
+            print(mask.sum().item())    
             del vjp_perturbed, denoised_perturbed
+            # import ipdb; ipdb.set_trace()
         # forward with final best noise
         # best_x_hat = cur_best_x_hat.detach().requires_grad_(True)
         best_x_hat = cur_best_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(cur_best_x_cur)
@@ -500,3 +494,4 @@ if __name__ == "__main__":
     main()
 
 #----------------------------------------------------------------------------
+ 
