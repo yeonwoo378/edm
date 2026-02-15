@@ -19,57 +19,177 @@ import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 
-# def estimate_divergence_hutchinson(
-#     pipe,
-#     latents: torch.Tensor,
-#     pred: torch.Tensor,
-#     eps_list,
-#     guidance_scale: float = 7.0,
-#     device: str = "cuda",
-# ):
-#     """
-#     Returns scalar divergence estimate:
-#       div(u)(x) = Tr(du/dx)
-#     using Hutchinson estimator: Tr(J) = E[eps^T J eps].
+# Our Divergence Algorithm
+def divergence_stepper( v_func,
+                        v_func_kwargs,
+                        x_key='z',
+                        t_key='t',
+                        stop_t=0.5,
+                        num_updates=1,
+                        num_delta=1,
+                        num_eps=1,
+                        delta_scale=1,
+                        delta_scheduler=lambda t: 1.0,
+                        seed_delta=None,
+                        seed_eps=None,
+                        resample_delta=False,
+                        resample_eps=False,
+                        sequential_vjp=True,
+                        sequential_hutchinson=True,
+                        ):
+    assert stop_t >= 0.0 and stop_t <= 1.0
 
-#     Implementation uses vJP:
-#       eps^T J eps = d/dx <u(x), eps> dotted with eps.
-#     """
-#     # Make latents a leaf so autograd.grad works reliably and does not keep old graphs.
-#     x = latents.detach().requires_grad_(True)
+    t = v_func_kwargs[t_key]
+    z = v_func_kwargs[x_key]
+    T = 80
+    if isinstance(t, torch.Tensor):
+        assert (t == t.mean()).all().item(), "All timesteps in the batch must be the same for divergence_stepper."
+        t = t.mean().item()
+        t =  1. - t/T # t is implemented as flow-based modeling in this function
+    # import ipdb; ipdb.set_trace()
+    if num_updates <= 0 or t > stop_t:
+        return v_func_kwargs[x_key], v_func(**v_func_kwargs)
 
-#     # Forward: u(x) (here: "pred" from sd3_timestep_pipe)
+    # z = v_func_kwargs[x_key]        
+    B = z.shape[0]
+    D = np.prod(z.shape[1:])  # C * H * W
+    
+    delta_generator = None
+    eps_generator = None
+    
+    if seed_delta is not None:
+        delta_generator = torch.Generator(device=z.device).manual_seed(seed_delta)
+    if seed_eps is not None:
+        eps_generator = torch.Generator(device=z.device).manual_seed(seed_eps)
+    sync_eps_with_delta = num_eps == 1 and seed_eps == seed_delta
+    
+    for update_idx in range(num_updates):
+        require_sample_delta = (update_idx == 0) or resample_delta
+        require_sample_eps = (update_idx == 0) or resample_eps
 
+        # compute divergence and find the best perturbation
+        if sequential_vjp:
+            assert (not resample_delta) or (num_delta==1)
+            for delta_idx in range(num_delta+1):
 
-#     # Accumulate multiple Hutchinson probes (common across candidates if eps_list is shared)
-#     div_total = torch.zeros((), device=x.device, dtype=torch.float32)
+                # pass if no need to get the divergence of original z
+                if delta_idx == 0 and update_idx != 0:
+                    continue
 
-#     n = len(eps_list)
-#     for s, eps in enumerate(eps_list):
-#         # Important: eps should not require grad
-#         eps = eps.detach()
+                delta = torch.randn(z.shape, generator=delta_generator, device=z.device) if delta_idx != 0 else torch.zeros_like(z, device=z.device)
 
-#         # scalar: <pred, eps> / D  (divide-by-D is optional; keeps scale tame)
-#         vp = torch.sum(pred * eps) / D
+                assert seed_delta != seed_eps, f"Is a Biased Estimator, {seed_delta} {seed_eps}"
 
-#         # vjp = d/dx vp = (J^T eps) / D
-#         # retain_graph must be True except for the last probe, because we reuse the same forward graph.
-#         vjp = torch.autograd.grad(
-#             vp,
-#             x,
-#             retain_graph=(s != n - 1),
-#             create_graph=False,
-#             allow_unused=False,
-#         )[0]
+                if sync_eps_with_delta and delta_idx != 0:
+                    eps = delta.detach()
 
-#         # eps^T J eps / D
-#         div_s = torch.sum(vjp * eps).to(torch.float32)
-#         div_total = div_total + div_s
+                else:
+                    eps = torch.randn(z.shape, generator=eps_generator, device=z.device) 
 
-#     div_avg = div_total / float(n)
+                perturbed_z = z + delta_scale * delta_scheduler(t) * delta # TODO: clarify
+                with torch.enable_grad():
+                    perturbed_z = perturbed_z.detach().requires_grad_(True)
+                    v_func_kwargs[x_key] = perturbed_z
+                    
+                    v_pred = v_func(**v_func_kwargs)  # [B, C, H, W]
+                    v_pred_eps = (v_pred * eps).flatten(1).sum(1)  # [B]
+                    grad_v = torch.autograd.grad(
+                        outputs=v_pred_eps,          # [B]
+                        inputs=perturbed_z,                      # [B, C, H, W]
+                        grad_outputs=torch.ones_like(v_pred_eps),  # [B]
+                        create_graph=False,
+                        retain_graph=False,         
+                    )[0].detach()  # [B, C, H, W]
+                    divergence = (grad_v * eps).flatten(1).sum(1) / D  # [B]
+                
+                if delta_idx == 0:
+                    best_divergence = divergence.detach()
+                    best_v_pred = v_pred.detach()
+                    best_perturbed_z = perturbed_z.detach()
+                else:
+                    improved = divergence < best_divergence
+                    improved_shape = (B,) + (1,) * (len(z.shape) - 1)
+                    best_divergence = torch.where(improved, divergence, best_divergence)
+                    best_v_pred = torch.where(
+                        improved.view(improved_shape),
+                        v_pred,
+                        best_v_pred,
+                    )
+                    best_perturbed_z = torch.where(
+                        improved.view(improved_shape),
+                        perturbed_z.detach(),
+                        best_perturbed_z,
+                    )
 
-#     # Return scalar tensor (float32)
-#     return div_avg
+            # update iteration-wise
+            z = best_perturbed_z.detach() # update z
+        
+        # currently not using hereafter
+        else:
+            # build delta
+            raise NotImplementedError
+            if require_sample_delta:            
+                delta_shape = (num_delta+1, ) + z.shape  # [num_delta, B, C, H, W]
+                delta = torch.randn(delta_shape, generator=delta_generator, device=z.device, dtype=z.dtype)  # [num_delta, B, C, H, W]
+                delta[0] = 0.0  # no perturbation for the first sample
+            
+            # build eps.
+            if require_sample_eps:
+                if sync_eps_with_delta:
+                    eps = delta.unsqueeze(0)  # [1, num_delta * B, C, H, W]
+                    # eps = repeat(eps, '1 nd b ... -> (ne nd b) ...', ne=num_eps)
+                else:
+                    eps_shape = (num_eps,) + z.shape  # [num_eps, B, C, H, W]
+                    eps = torch.randn(eps_shape, generator=eps_generator, device=z.device, dtype=z.dtype)  # [num_eps, B, C, H, W]
+                    # eps_shape = (num_eps, num_delta+1,) + z.shape # Tip: sample more and rearrange for independent eps.
+            
+            # expand v_func_kwargs
+            perturbed_z = z.unsqueeze(0) + delta_scale * delta_scheduler(t) * delta
+            perturbed_z = rearrange(perturbed_z, 'nd b ... -> (nd b) ...', nd=num_delta+1, b=B)
+            perturbed_z = perturbed_z.detach().requires_grad_(True)
+            
+            # compute v
+            with torch.enable_grad():            
+                v_func_kwargs[x_key] = perturbed_z
+                v_func_kwargs_expanded = expand_v_func_kwargs(v_func_kwargs, batch_size=B, expand_size=num_delta+1)
+                v_pred_expanded = v_func(**v_func_kwargs_expanded)  # [(num_delta+1) * B, C, H, W]
+
+                divergence = []
+                if sequential_hutchinson:
+                    for eps_idx, eps_i in enumerate(eps):  # [B, C, H, W]
+                        retain_graph = (eps_idx < eps.shape[0] - 1) # retain graph except for the last one
+                        v_pred_eps = (v_pred_expanded * eps_i.unsqueeze(0)).flatten(1).sum(1)  # [(num_delta+1) * B]
+                        grad_v = torch.autograd.grad(
+                            outputs=v_pred_eps,          # [(num_delta+1) * B]
+                            inputs=perturbed_z,                      # [(num_delta+1) * B, C, H, W]
+                            grad_outputs=torch.ones_like(v_pred_eps),  # [(num_delta+1) * B]
+                            create_graph=False,
+                            retain_graph=retain_graph,         
+                        )[0].detach()  # [(num_delta+1) * B, C, H, W]
+                        
+                        divergence_i = (grad_v * eps_i.unsqueeze(0)).flatten(1).sum(1) / D  # [(num_delta+1) * B]
+                        divergence.append(divergence_i)
+                    divergence = torch.stack(divergence, dim=0)  # [num_eps, (num_delta+1) * B]
+                    divergence = divergence.mean(0)  # [(num_delta+1) * B]
+                else:
+                    v_pred_eps = (v_pred_expanded.unsqueeze(0) * eps.flatten(1).unsqueeze(1)).flatten(2).sum(2)  # [num_eps, (num_delta+1) * B]
+                    grad_v = torch.autograd.grad(
+                        outputs=v_pred_eps,          # [num_eps, (num_delta+1) * B]
+                        inputs=perturbed_z,                      # [(num_delta+1) * B, C, H, W]
+                        grad_outputs=torch.ones_like(v_pred_eps),  # [num_eps, (num_delta+1) * B]
+                        create_graph=False,
+                        retain_graph=False,         
+                    )[0].detach()  # [(num_delta+1) * B, C, H, W]
+                    
+                    divergence = (grad_v.unsqueeze(0) * eps.flatten(1).unsqueeze(1)).flatten(2).sum(2) / D  # [num_eps, (num_delta+1) * B]
+                    divergence = divergence.mean(0)  # [(num_delta+1) * B]
+            # select the best perturbation based on divergence
+            divergence = divergence.view(num_delta+1, B)  # [num_delta+1, B]
+            best_divergence, best_idx = torch.min(divergence, dim=0)
+            best_perturbed_z = rearrange(perturbed_z, '(nd b) ... -> nd b ...', nd=num_delta+1, b=B)[best_idx, torch.arange(B)]  # [B, C, H, W]
+            best_v_pred = rearrange(v_pred_expanded, '(nd b) ... -> nd b ...', nd=num_delta+1, b=B)[best_idx, torch.arange(B)]  # [B, C, H, W]
+            z = best_perturbed_z.detach()
+    return best_perturbed_z.detach(), best_v_pred.detach()
 
 
 #----------------------------------------------------------------------------
@@ -113,6 +233,37 @@ def edm_sampler(
     return x_next
 
 
+#----------------------------------------------------------------------------
+def edm_v_pred(
+    net, x_cur, t_cur, t_next, i, class_labels=None, randn_like=torch.randn_like,
+    num_steps=18, S_noise=1, gamma=0.0
+):
+
+    t_hat = net.round_sigma(t_cur + gamma * t_cur) # t_cur
+    x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur) # x_cur
+
+    # Euler step.
+    denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+    d_cur = (x_hat - denoised) / t_hat
+    # d_cur corresponds to v
+    x_next = x_hat + (t_next - t_hat) * d_cur
+
+    # Apply 2nd order correction.
+    if i < num_steps - 1:
+        denoised = net(x_next, t_next, class_labels).to(torch.float64)
+        d_prime = (x_next - denoised) / t_next
+        v_pred = 0.5 * d_cur + 0.5 * d_prime
+    else:
+        v_pred = d_cur
+
+    return v_pred
+
+def edm_x_next(
+    x_hat, t_next, t_hat, v_pred
+):
+    x_next = x_hat + (t_next - t_hat) * v_pred
+    return x_next
+
 ## ours
 def edm_sampler_ours(
     net, latents, class_labels=None, randn_like=torch.randn_like,
@@ -133,98 +284,123 @@ def edm_sampler_ours(
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-        
         x_cur = x_next
-        x_cur = x_cur.detach().requires_grad_(True)
+
         # Increase noise temporarily.
         gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-        t_hat = net.round_sigma(t_cur + gamma * t_cur)
-        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+        # NOTE: gamma is zero in official CIFAR-10 implementation
+        # therefore, we treat t_hat as t_cur
+        # Should be fixed when running with ImageNet
 
-        # Euler step.
-        # x_hat = x_hat.detach().requires_grad_(True)
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64) # (B, C, H, W)
-        # approximate divergence with Hutchinson's estimator
-        # single noise for estimation 
-        noise = torch.randn(x_hat.shape, device=x_hat.device, generator=torch.Generator(SEED)) # (B, C, H, W)
+        # v_pred -> ours algo -> x_pred (latent update)
+        v_pred_func = edm_v_pred
+        v_func_kwargs = {
+            'net': net,
+            'x_cur': x_cur,
+            't_cur': t_cur,
+            't_next': t_next,
+            'i': i,
+            'class_labels': class_labels,
+            'randn_like': randn_like,
+            'num_steps': num_steps,
+            'S_noise': S_noise,
+            'gamma': gamma
+        }
 
-        vjp = torch.autograd.grad(
-            denoised,
-            x_cur,
-            grad_outputs=noise,
-            retain_graph=False,
-            create_graph=False
-        )[0] # (B, C, H, W)
+        # import ipdb; ipdb.set_trace()
 
-        # div = torch.sum(vjp * noise).to(torch.float32)
-        div_per_sample = (vjp * noise).flatten(1).sum(1).float()  # (B,)
-        D = x_hat.shape[1] * x_hat.shape[2] * x_hat.shape[3]  # dimensionality
-        # div = div / float(D)
-        # print('step:', i, 'divergence:', div.item())
-
-        cur_best_x_hat = x_hat.detach()
-        cur_best_x_cur = x_cur.detach()
-        cur_best_div = div_per_sample.detach() / float(D)  # (B,)
-        # print('Initial divergence:', cur_best_div, cur_best_div.shape)
-
-        ## our algorithm
-        lr_t = (1. - i / num_steps) * lr 
-        for iter in range(num_iter):
-            gen = torch.Generator(device=x_hat.device)
-            gen.manual_seed(SEED + iter + 1)
-            new_noise = torch.randn(x_hat.shape, device=x_hat.device, generator=gen)
-
-            # if i == 0:
-            #     perturbed_x_cur = np.sqrt(1. - lr_t**2) * cur_best_x_cur + lr_t * new_noise
-            #     # perturbed_x_hat = (1. - lr_t) * cur_best_x_hat + lr_t * new_noise
-            # else:
-            
-                # perturbed_x_hat = cur_best_x_hat + lr_t * new_noise
-            perturbed_x_cur = cur_best_x_cur + lr_t * new_noise
-            perturbed_x_cur = perturbed_x_cur.detach().requires_grad_(True)
-            # perturbed_x_hat = perturbed_x_hat.detach().requires_grad_(True)
-            perturbed_x_hat = perturbed_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(perturbed_x_cur)
-            denoised_perturbed = net(perturbed_x_hat, t_hat, class_labels).to(torch.float64)
-
-            vjp_perturbed = torch.autograd.grad(
-                denoised_perturbed,
-                perturbed_x_cur,
-                grad_outputs=noise,
-                retain_graph=False,
-                create_graph=False
-            )[0] # (B, C, H, W) 
-            div_perturbed_per_sample = (vjp_perturbed * noise).flatten(1).sum(1).float() / float(D)
-            # print(f'Iter {iter}: perturbed divergence:', div_perturbed_per_sample, div_perturbed_per_sample.shape)
-
-
-            mask = (div_perturbed_per_sample) ** 2 < (cur_best_div) ** 2
-            mask = mask.view(-1, *[1]*(len(x_hat.shape)-1))  # reshape for broadcasting
-            cur_best_x_hat = torch.where(mask, perturbed_x_hat.detach(), cur_best_x_hat)
-            cur_best_div = torch.where(mask.squeeze(), div_perturbed_per_sample.detach(), cur_best_div)
-            cur_best_x_cur = torch.where(mask, perturbed_x_cur.detach(), cur_best_x_cur)
-            # print('Updated divergence:', cur_best_div, cur_best_div.shape   )
-            # print('mask sum:', mask, mask.shape)
-            print(mask.sum().item())    
-            del vjp_perturbed, denoised_perturbed
-            # import ipdb; ipdb.set_trace()
-        # forward with final best noise
-        # best_x_hat = cur_best_x_hat.detach().requires_grad_(True)
-        best_x_hat = cur_best_x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(cur_best_x_cur)
-        denoised = net(best_x_hat, t_hat, class_labels).to(torch.float64)
-
-
-        x_hat = best_x_hat.detach()
-        d_cur = (x_hat - denoised) / t_hat
-        x_next = x_hat + (t_next - t_hat) * d_cur
-
-        # Apply 2nd order correction.
-        if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
-            d_prime = (x_next - denoised) / t_next
-            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
-
+        best_x, best_v_pred = divergence_stepper(v_pred_func,
+                                                v_func_kwargs,
+                                                x_key='x_cur',
+                                                t_key='t_cur', 
+                                                stop_t=0.5,
+                                                delta_scale=2.* (t_cur/80), # 0.5
+                                                num_updates=1,
+                                                seed_delta=1234,
+                                                seed_eps=42)
+        
+        x_next = edm_x_next(best_x, t_next, t_cur, best_v_pred).detach()
     return x_next
 
+#----------------------------------------------------------------------------
+def euler_v_pred(
+    net, x_cur, t_cur, t_next, i, class_labels=None, randn_like=torch.randn_like,
+    num_steps=18, S_noise=1, gamma=0.0
+):
+
+    t_hat = net.round_sigma(t_cur + gamma * t_cur) # t_cur
+    x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur) # x_cur
+
+    # Euler step.
+    denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+    d_cur = (x_hat - denoised) / t_hat
+    # d_cur corresponds to v
+    v_pred = d_cur
+
+    return v_pred
+
+def euler_x_next(
+    x_hat, t_next, t_hat, v_pred
+):
+    x_next = x_hat + (t_next - t_hat) * v_pred
+    return x_next
+
+## ours
+def euler_sampler_ours(
+    net, latents, class_labels=None, randn_like=torch.randn_like,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, num_iter=2, seed=42, lr=0.5
+):
+    SEED = seed
+
+    # Adjust noise levels based on what's supported by the network.
+    sigma_min = max(sigma_min, net.sigma_min)
+    sigma_max = min(sigma_max, net.sigma_max)
+
+    # Time step discretization.
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+
+    # Main sampling loop.
+    x_next = latents.to(torch.float64) * t_steps[0]
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        x_cur = x_next
+
+        # Increase noise temporarily.
+        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+        # NOTE: gamma is zero in official CIFAR-10 implementation
+        # therefore, we treat t_hat as t_cur
+        # Should be fixed when running with ImageNet
+
+        # v_pred -> ours algo -> x_pred (latent update)
+        v_pred_func = euler_v_pred
+        v_func_kwargs = {
+            'net': net,
+            'x_cur': x_cur,
+            't_cur': t_cur,
+            't_next': t_next,
+            'i': i,
+            'class_labels': class_labels,
+            'randn_like': randn_like,
+            'num_steps': num_steps,
+            'S_noise': S_noise,
+            'gamma': gamma
+        }
+
+        best_x, best_v_pred = divergence_stepper(v_pred_func,
+                                                v_func_kwargs,
+                                                x_key='x_cur',
+                                                t_key='t_cur',
+                                                stop_t=0.5,
+                                                delta_scale=0.1,
+                                                num_updates=1,
+                                                seed_delta=1234,
+                                                seed_eps=42
+                                                )
+        
+        x_next = euler_x_next(best_x, t_next, t_cur, best_v_pred)
+    return x_next
 
 #----------------------------------------------------------------------------
 # Generalized ablation sampler, representing the superset of all sampling
