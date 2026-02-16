@@ -10,6 +10,7 @@
 
 import os
 import re
+import math
 import click
 import tqdm
 import pickle
@@ -19,38 +20,67 @@ import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 
+# scheduling util
+def get_scheduled_value(total, cur, schedule_type):
+    if schedule_type == 'constant': 
+        return 1.0
+
+    elif schedule_type == 'linear': # (t/T)
+        return cur / total
+    
+    elif schedule_type == 'cosine': 
+        return 0.5 * (1. - math.cos(math.pi * ( cur / total)))
+    
+    elif schedule_type == 'sqrt':
+        return  math.sqrt(cur / total)
+    
+    # elif schedule_type == 'concave':
+    #     raise NotImplementedError
+    #     # return (1. - cur / total) ** 2
+    
+    # elif schedule_type == 'convex':
+    #     return  (cur / total) ** 2
+    
+    else:
+        raise ValueError(f"Unknown schedule_type: {schedule_type}")
+
+
 # Our Divergence Algorithm
+ 
+@torch.no_grad()
 def divergence_stepper( v_func,
                         v_func_kwargs,
                         x_key='z',
                         t_key='t',
-                        stop_t=0.5,
+                        stop_t=1.0,
                         num_updates=1,
                         num_delta=1,
                         num_eps=1,
                         delta_scale=1,
-                        delta_scheduler=lambda t: 1.0,
+                        delta_scheduler=lambda t: 1.0 - t/2,
                         seed_delta=None,
                         seed_eps=None,
+                        delta=None,
+                        improved=None,
                         resample_delta=False,
                         resample_eps=False,
                         sequential_vjp=True,
                         sequential_hutchinson=True,
+                        eta=0.0,
+                        sync_over_time=False
                         ):
     assert stop_t >= 0.0 and stop_t <= 1.0
 
     t = v_func_kwargs[t_key]
-    z = v_func_kwargs[x_key]
-    T = 80
     if isinstance(t, torch.Tensor):
         assert (t == t.mean()).all().item(), "All timesteps in the batch must be the same for divergence_stepper."
         t = t.mean().item()
-        t =  1. - t/T # t is implemented as flow-based modeling in this function
-    # import ipdb; ipdb.set_trace()
-    if num_updates <= 0 or t > stop_t:
-        return v_func_kwargs[x_key], v_func(**v_func_kwargs)
+        t = 1. - t/80
 
-    # z = v_func_kwargs[x_key]        
+    if num_updates <= 0 or t > stop_t:
+        return v_func_kwargs[x_key], v_func(**v_func_kwargs), improved, delta
+    # import ipdb; ipdb.set_trace()
+    z = v_func_kwargs[x_key]        
     B = z.shape[0]
     D = np.prod(z.shape[1:])  # C * H * W
     
@@ -58,7 +88,10 @@ def divergence_stepper( v_func,
     eps_generator = None
     
     if seed_delta is not None:
-        delta_generator = torch.Generator(device=z.device).manual_seed(seed_delta)
+        if sync_over_time:
+            delta_generator = torch.Generator(device=z.device).manual_seed(seed_delta) # + int(t * 1000))
+        else:
+            delta_generator = torch.Generator(device=z.device).manual_seed(seed_delta + int(t * 1000))
     if seed_eps is not None:
         eps_generator = torch.Generator(device=z.device).manual_seed(seed_eps)
     sync_eps_with_delta = num_eps == 1 and seed_eps == seed_delta
@@ -73,20 +106,33 @@ def divergence_stepper( v_func,
             for delta_idx in range(num_delta+1):
 
                 # pass if no need to get the divergence of original z
-                if delta_idx == 0 and update_idx != 0:
+                if delta_idx == 0 and update_idx !=0:
                     continue
-
-                delta = torch.randn(z.shape, generator=delta_generator, device=z.device) if delta_idx != 0 else torch.zeros_like(z, device=z.device)
-
-                assert seed_delta != seed_eps, f"Is a Biased Estimator, {seed_delta} {seed_eps}"
+                
+                if delta is None or improved is None:
+                    assert improved is None and t == 0.0 and delta_idx <= 1
+                    delta = torch.randn(z.shape, generator=delta_generator, device=z.device) # if delta_idx != 0 else torch.zeros_like(z, device=z.device)
+                elif delta_idx > 0:
+                    new_delta = torch.randn(z.shape, generator=delta_generator, device=z.device) #if delta_idx != 0 else torch.zeros_like(z, device=z.device)
+                    delta = torch.where(
+                        improved.reshape(-1, *([1]*(z.ndim-1))), # hard-coded shape
+                        delta, # True
+                        new_delta # False
+                    )
+                # no update delta when delta_idx=0
+                assert seed_delta != seed_eps, "Is a Biased Estimator"
 
                 if sync_eps_with_delta and delta_idx != 0:
                     eps = delta.detach()
+                    raise NotImplementedError # not using anymore!
 
                 else:
                     eps = torch.randn(z.shape, generator=eps_generator, device=z.device) 
 
-                perturbed_z = z + delta_scale * delta_scheduler(t) * delta # TODO: clarify
+                if delta_idx == 0:
+                    perturbed_z = z 
+                else:
+                    perturbed_z = z + delta_scale * delta_scheduler(update_idx) * delta # TODO: clarify
                 with torch.enable_grad():
                     perturbed_z = perturbed_z.detach().requires_grad_(True)
                     v_func_kwargs[x_key] = perturbed_z
@@ -102,12 +148,14 @@ def divergence_stepper( v_func,
                     )[0].detach()  # [B, C, H, W]
                     divergence = (grad_v * eps).flatten(1).sum(1) / D  # [B]
                 
+                threshold = - (1 / (1 - t))
+
                 if delta_idx == 0:
                     best_divergence = divergence.detach()
                     best_v_pred = v_pred.detach()
                     best_perturbed_z = perturbed_z.detach()
                 else:
-                    improved = divergence < best_divergence
+                    improved = (divergence < (best_divergence - eta)) & (best_divergence >= threshold)
                     improved_shape = (B,) + (1,) * (len(z.shape) - 1)
                     best_divergence = torch.where(improved, divergence, best_divergence)
                     best_v_pred = torch.where(
@@ -115,6 +163,7 @@ def divergence_stepper( v_func,
                         v_pred,
                         best_v_pred,
                     )
+                    # print(improved.view(improved_shape).shape)
                     best_perturbed_z = torch.where(
                         improved.view(improved_shape),
                         perturbed_z.detach(),
@@ -122,7 +171,7 @@ def divergence_stepper( v_func,
                     )
 
             # update iteration-wise
-            z = best_perturbed_z.detach() # update z
+            z = best_perturbed_z # update z
         
         # currently not using hereafter
         else:
@@ -189,7 +238,7 @@ def divergence_stepper( v_func,
             best_perturbed_z = rearrange(perturbed_z, '(nd b) ... -> nd b ...', nd=num_delta+1, b=B)[best_idx, torch.arange(B)]  # [B, C, H, W]
             best_v_pred = rearrange(v_pred_expanded, '(nd b) ... -> nd b ...', nd=num_delta+1, b=B)[best_idx, torch.arange(B)]  # [B, C, H, W]
             z = best_perturbed_z.detach()
-    return best_perturbed_z.detach(), best_v_pred.detach()
+    return best_perturbed_z, best_v_pred, improved, delta
 
 
 #----------------------------------------------------------------------------
@@ -268,9 +317,11 @@ def edm_x_next(
 def edm_sampler_ours(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, num_iter=2, seed=42, lr=0.5
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, num_iter=2, seed=42, lr=0.5, 
+    delta_scale=2.0, delta_schedule_type='cosine',
 ):
     SEED = seed
+    T = 80
 
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
@@ -283,6 +334,8 @@ def edm_sampler_ours(
 
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
+    delta = None
+    improved = None
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
         x_cur = x_next
 
@@ -308,16 +361,21 @@ def edm_sampler_ours(
         }
 
         # import ipdb; ipdb.set_trace()
+        delta_schedule = get_scheduled_value(T, t_cur, delta_schedule_type)
 
-        best_x, best_v_pred = divergence_stepper(v_pred_func,
+        best_x, best_v_pred, improved, delta = divergence_stepper(v_pred_func,
                                                 v_func_kwargs,
                                                 x_key='x_cur',
                                                 t_key='t_cur', 
                                                 stop_t=0.5,
-                                                delta_scale=2.* (t_cur/80), # 0.5
+                                                delta_scale=delta_scale * delta_schedule, # 0.5
                                                 num_updates=1,
                                                 seed_delta=1234,
-                                                seed_eps=42)
+                                                seed_eps=42,
+                                                delta=delta,
+                                                improved=improved,
+
+                                                )
         
         x_next = edm_x_next(best_x, t_next, t_cur, best_v_pred).detach()
     return x_next
@@ -348,7 +406,7 @@ def euler_x_next(
 ## ours
 def euler_sampler_ours(
     net, latents, class_labels=None, randn_like=torch.randn_like,
-    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7, delta_scale=2.0,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, num_iter=2, seed=42, lr=0.5
 ):
     SEED = seed
@@ -361,7 +419,8 @@ def euler_sampler_ours(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
-
+    delta = None
+    improved = None
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
@@ -388,15 +447,17 @@ def euler_sampler_ours(
             'gamma': gamma
         }
 
-        best_x, best_v_pred = divergence_stepper(v_pred_func,
+        best_x, best_v_pred, improved, delta = divergence_stepper(v_pred_func,
                                                 v_func_kwargs,
                                                 x_key='x_cur',
                                                 t_key='t_cur',
                                                 stop_t=0.5,
-                                                delta_scale=0.1,
+                                                delta_scale=delta_scale,
                                                 num_updates=1,
                                                 seed_delta=1234,
-                                                seed_eps=42
+                                                seed_eps=42,
+                                                delta=delta,
+                                                improved=improved,
                                                 )
         
         x_next = euler_x_next(best_x, t_next, t_cur, best_v_pred)
@@ -565,8 +626,8 @@ def parse_int_list(s):
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
 
 # sampler options
-@click.option('--sampler', 'sampler_type', help='Sampler type', metavar='ours|default',                              type=click.Choice(['ours', 'default']), default='ours')
-@click.option('--sampler_lr',              help='x_t update rate', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=0.5)
+@click.option('--sampler', 'sampler_type', help='Sampler type', metavar='ours|default|ours_euler',                              type=click.Choice(['ours', 'default', 'ours_euler']), default='ours')
+@click.option('--sampler_lr', 'delta_scale', help='x_t update rate', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=0.5)
 @click.option('--sampler_iter',            help='Number of iterations for each step', metavar='INT',              type=click.IntRange(min=1), default=2)
 
 
@@ -584,7 +645,7 @@ def parse_int_list(s):
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, exp_name, subdirs, seeds, class_idx, max_batch_size, sampler_lr, sampler_iter, device=torch.device('cuda'), sampler_type='ours', **sampler_kwargs):
+def main(network_pkl, exp_name, subdirs, seeds, class_idx, max_batch_size, sampler_iter, delta_scale, device=torch.device('cuda'), sampler_type='ours', **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -644,9 +705,13 @@ def main(network_pkl, exp_name, subdirs, seeds, class_idx, max_batch_size, sampl
         # if sampler_kwargs.get('ours', False):
         if sampler_type == 'ours':
             sampler_fn = edm_sampler_ours
-            images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, lr=sampler_lr, num_iter=sampler_iter, **sampler_kwargs)
+            images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, num_iter=sampler_iter, delta_scale=delta_scale, **sampler_kwargs)
+        if sampler_type == 'ours_euler':
+            sampler_fn = euler_sampler_ours
+            images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, num_iter=sampler_iter, delta_scale=delta_scale, **sampler_kwargs)
         else:
             sampler_fn = edm_sampler
+            sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
             images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
         # Save images.
